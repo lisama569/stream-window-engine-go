@@ -1,12 +1,18 @@
 // Package engine 组装水位线、窗口状态、本地源/汇，提供并发安全的流式执行核心。
+// 支持滚动窗口（WindowSlideMillis 缺省或等于窗口大小）与重叠滑动窗口
+// （WindowSlideMillis < WindowSizeMillis）：同一条事件同时路由到覆盖它的全部窗口，
+// 各窗口独立聚合、独立按水位线关闭/修正/清理。
 //
 // 并发模型：按 key 的 FNV 哈希把 key 空间划分到固定数量的 shard；同一 key 的事件
 // 始终进入同一 shard，shard 内串行处理，因此该 key 的水位线与窗口状态天然一致；
 // 不同 shard 并行推进。输出汇聚到线程安全的 endpoint.Sink，按接收顺序保留。
 //
-// 确定性：窗口触发顺序在每个 shard 内按 (windowStart, key) 排序；同一 (key,window)
-// 的输出携带单调递增 Version（Fire=0，迟到修正为 UPDATE 1..n），任何重放/重启后
-// 最大 Version 即确定结果，重复事件被去重不会产生第二次有效输出。
+// 确定性：窗口触发顺序在每个 shard 内按 (windowStart, key) 排序；一次提交让多个
+// 重叠窗口同时到点时同样按窗口起点升序输出，同批输入每次运行输出流完全一致。
+// 同一 (key,window) 的输出携带单调递增 Version（Fire=0，迟到修正为 UPDATE 1..n），
+// 任何重放/重启后最大 Version 即确定结果；重复事件在每个窗口各自去重，不会产生
+// 第二次有效输出。Processed/DroppedDup/DroppedLate/DroppedMemory 均按"事件×窗口
+// 归属"计数（滚动窗口每事件恰 1 个归属，与历史口径一致）。
 package engine
 
 import (
@@ -34,14 +40,20 @@ var ErrEngineClosed = errors.New("engine already closed")
 type Config struct {
 	// ShardCount 并发分片数（按 key 哈希）；<=0 时取 1。
 	ShardCount int
-	// WindowSizeMillis 滚动窗口大小（毫秒，必须 >0）。
+	// WindowSizeMillis 窗口大小（毫秒，必须 >0）。
 	WindowSizeMillis int64
+	// WindowSlideMillis 滑动步长（毫秒）。<=0 或 >= WindowSizeMillis 时退化为
+	// WindowSizeMillis，即与历史完全一致的滚动（tumbling）窗口；
+	// 0 < 值 < WindowSizeMillis 时为重叠滑动窗口，一份事件同时进入覆盖它的每个窗口。
+	WindowSlideMillis int64
 	// OutOfOrderMillis 水位线乱序容忍：WM = maxSeen - OutOfOrderMillis。
 	OutOfOrderMillis int64
 	// AllowedLatenessMillis 窗口 Fire 后仍接受迟到修正的宽限期；
 	// watermark >= end+AllowedLateness 后窗口清理，再到的事件判迟到丢弃。
 	AllowedLatenessMillis int64
 	// MaxKeys 每个 shard 活跃 key 数硬上限（内存边界）；<=0 表示不限。
+	// 滑动窗口下已存在 key 的窗口扇出（每 key 至多 ceil(size/slide) 个）不占用新 key
+	// 名额，只有全新 key 建窗才受此上限约束。
 	MaxKeys int
 }
 
@@ -51,6 +63,10 @@ func (c Config) normalized() Config {
 	}
 	if c.WindowSizeMillis <= 0 {
 		c.WindowSizeMillis = 1
+	}
+	if c.WindowSlideMillis <= 0 || c.WindowSlideMillis >= c.WindowSizeMillis {
+		// 步长缺省或不小于窗口大小：退化为滚动窗口，历史行为保持不变。
+		c.WindowSlideMillis = c.WindowSizeMillis
 	}
 	if c.OutOfOrderMillis < 0 {
 		c.OutOfOrderMillis = 0
@@ -160,18 +176,20 @@ func (e *Engine) Submit(_ context.Context, ev event.Event) error {
 	if out.purged > 0 {
 		e.purgedWindows.Add(int64(out.purged))
 	}
-	switch out.reason {
-	case "":
-		e.processed.Add(1)
-	case DropLate:
-		e.droppedLate.Add(1)
-		e.sink.CollectDrop(window.Drop{Ev: ev, Reason: DropLate})
-	case DropMemoryLimit:
-		e.droppedMemory.Add(1)
-		e.sink.CollectDrop(window.Drop{Ev: ev, Reason: DropMemoryLimit})
-	case window.ReasonDuplicate:
+	// 计数器与 Drop 信号均按"窗口归属"计：滚动窗口每事件至多 1 个归属（与历史口径
+	// 一致）；滑动窗口下同一事件在它命中的每个窗口里各自独立结算，互不串味。
+	e.processed.Add(int64(out.accepted))
+	for _, d := range out.dups {
 		e.droppedDup.Add(1)
-		e.sink.CollectDrop(window.Drop{Ev: ev, Reason: window.ReasonDuplicate})
+		e.sink.CollectDrop(window.Drop{Ev: ev, Reason: window.ReasonDuplicate, WindowStart: d.start, WindowEnd: d.end})
+	}
+	for _, d := range out.lates {
+		e.droppedLate.Add(1)
+		e.sink.CollectDrop(window.Drop{Ev: ev, Reason: DropLate, WindowStart: d.start, WindowEnd: d.end})
+	}
+	for _, d := range out.memory {
+		e.droppedMemory.Add(1)
+		e.sink.CollectDrop(window.Drop{Ev: ev, Reason: DropMemoryLimit, WindowStart: d.start, WindowEnd: d.end})
 	}
 	return nil
 }
