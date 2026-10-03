@@ -28,7 +28,7 @@ func newShard(id int, cfg Config, logf func(string, ...any)) *shard {
 	return &shard{
 		id:       id,
 		cfg:      cfg,
-		spec:     window.Spec{SizeMillis: cfg.WindowSizeMillis},
+		spec:     window.Spec{SizeMillis: cfg.WindowSizeMillis, SlideMillis: cfg.SlideMillis},
 		wm:       watermark.New(cfg.OutOfOrderMillis, 0),
 		windows:  make(map[int64]map[string]*window.Agg),
 		versions: make(map[string]map[int64]int64),
@@ -63,7 +63,7 @@ func (s *shard) version(key string, start int64) int64 {
 }
 
 // getOrCreate 在持锁状态下取/建聚合；受内存上限约束。
-// 返回 (agg, rejected)：触发内存上限时 rejected=true。
+// 返回 (agg, rejected)：触发内存上限（MaxKeys 或 MaxWindows）时 rejected=true。
 func (s *shard) getOrCreate(key string, start int64) (*window.Agg, bool) {
 	ks, ok := s.windows[start]
 	if !ok {
@@ -74,6 +74,9 @@ func (s *shard) getOrCreate(key string, start int64) (*window.Agg, bool) {
 		return a, false
 	}
 	if s.cfg.MaxKeys > 0 && s.activeKeysLocked() >= s.cfg.MaxKeys {
+		return nil, true
+	}
+	if s.cfg.MaxWindows > 0 && s.activeWindowsLocked() >= s.cfg.MaxWindows {
 		return nil, true
 	}
 	end := s.spec.End(start)
@@ -167,9 +170,10 @@ func (s *shard) fireDueLocked() []window.Result {
 
 // submitOutcome 是一次事件处理的确定性产物。
 type submitOutcome struct {
-	results []window.Result
-	reason  string // 空字符串表示事件被计入
-	purged  int    // 本次顺带清理的过宽限期窗口数
+	results   []window.Result // 本次产生的全部输出（迟到 UPDATE + 到点 FIRE，确定顺序）
+	drops     []window.Drop   // 按窗口分别记录的未计入处置（原因互斥可区分）
+	purged    int             // 本次顺带清理的过宽限期窗口数
+	acceptedN int             // 本次事件真正计入的窗口数（>=1 即 processed）
 }
 
 // submit 处理一条已通过结构校验的事件。
@@ -177,78 +181,77 @@ func (s *shard) submit(ev event.Event) submitOutcome {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	start := s.spec.Start(ev.EventTime)
-	end := s.spec.End(start)
-	lateByWM := s.wm.IsLate(ev.EventTime)
+	targets := s.spec.Starts(ev.EventTime)
 
-	s.log("[shard=%d] INPUT id=%s key=%s eventTime=%d -> window=[%d,%d) watermark=%d lateByWM=%v",
-		s.id, ev.ID, ev.Key, ev.EventTime, start, end, s.wm.Current(), lateByWM)
+	s.log("[shard=%d] INPUT id=%s key=%s eventTime=%d watermark=%d 命中窗口数=%d %v",
+		s.id, ev.ID, ev.Key, ev.EventTime, s.wm.Current(), len(targets), s.bounds(targets))
 
 	// 1) 观察事件时间，推进单调水位线（只进不退）。
 	s.wm.Observe(ev.EventTime)
 
-	// 2) 若目标窗口已超过宽限期（含到点未输出的极端情形不可能发生：到点窗口会在
-	//    上一步推进后立刻 Fire），迟到丢弃。
-	//    先把所有到点窗口 Fire，保证"先触发、后清理"的严格次序。
-	if s.wm.Current() > end+s.cfg.AllowedLatenessMillis {
-		out := s.fireDueLocked()
-		purged := s.purgeExpiredLocked()
-		s.log("[shard=%d] DROP id=%s reason=%s eventTime=%d watermark=%d (window=[%d,%d) 宽限至 %d)",
-			s.id, ev.ID, DropLate, ev.EventTime, s.wm.Current(), start, end, end+s.cfg.AllowedLatenessMillis)
-		return submitOutcome{results: out, reason: DropLate, purged: len(purged)}
+	// 2) 先触发到点窗口、再清理过宽限期窗口（严格"先触发、后清理"）。
+	//    滚动窗口下与原行为一致：迟到判定时旧窗口已被 Fire/PURGE；容量判定时也已尽力回收。
+	fired := s.fireDueLocked()
+	purged := s.purgeExpiredLocked()
+
+	// 3) 事件逐个进入覆盖它的窗口；各窗口独立聚合、独立迟到/重复/容量判定，互不串味。
+	var updates []window.Result
+	var drops []window.Drop
+	acceptedN := 0
+	wm := s.wm.Current()
+	for _, start := range targets {
+		end := s.spec.End(start)
+		// 3a) 过宽限期：该窗口在第 2 步已被清理（或从未创建），绝不重建。
+		//     同事件的其他覆盖窗口不受影响，各自照常处理。
+		if wm > end+s.cfg.AllowedLatenessMillis {
+			s.log("[shard=%d] DROP id=%s reason=%s eventTime=%d watermark=%d (window=[%d,%d) 宽限至 %d)",
+				s.id, ev.ID, DropLate, ev.EventTime, wm, start, end, end+s.cfg.AllowedLatenessMillis)
+			drops = append(drops, window.Drop{Ev: ev, Reason: DropLate, WindowStart: start, WindowEnd: end})
+			continue
+		}
+		// 3b) 取既有聚合或新建（受容量上限约束；第 2 步已尽力回收，这里仍不足才拒绝本窗口）。
+		a := s.lookupAgg(ev.Key, start)
+		if a == nil {
+			a2, rejected := s.getOrCreate(ev.Key, start)
+			if rejected {
+				s.log("[shard=%d] DROP id=%s reason=%s key=%s window=[%d,%d) activeKeys/activeWindows 已达上限",
+					s.id, ev.ID, DropMemoryLimit, ev.Key, start, end)
+				drops = append(drops, window.Drop{Ev: ev, Reason: DropMemoryLimit, WindowStart: start, WindowEnd: end})
+				continue
+			}
+			a = a2
+		}
+		// 3c) 同一事件 ID 在同一 (key,window) 内只计一次；重复除幂等水位线观察外无副作用：
+		//     不计数、不产生 FIRE/UPDATE。
+		if ok, reason := a.Add(ev); !ok {
+			s.log("[shard=%d] DROP id=%s reason=%s key=%s window=[%d,%d) 重复事件：不计数/不输出",
+				s.id, ev.ID, reason, ev.Key, start, end)
+			drops = append(drops, window.Drop{Ev: ev, Reason: reason, WindowStart: start, WindowEnd: end})
+			continue
+		}
+		// 3d) 已 Fire 窗口在宽限期内被修正 -> 该窗口独立产出一条递增 UPDATE。
+		if a.Closed() {
+			s.log("[shard=%d] LATE-WITHIN-TOLERANCE id=%s eventTime=%d 修正窗口 [%d,%d)",
+				s.id, ev.ID, ev.EventTime, start, end)
+			updates = append(updates, s.emitLocked(a, window.Update))
+		}
+		acceptedN++
 	}
 
-	// 2.5) 若该事件 ID 已计入目标窗口（典型场景：快照恢复后重放已消费数据），
-	// 它是重复事件：第 1 步已幂等观察其时间戳（WM 只进不退），此后不得再有任何
-	// 副作用——不重复计数、不触发 Fire/Update。这样重放历史数据既能把水位线重建
-	// 到快照点，又保证输出不重不漏。
-	if a0 := s.lookupAgg(ev.Key, start); a0 != nil {
-		if _, dupReason := a0.Add(ev); dupReason != "" {
-			s.log("[shard=%d] DROP id=%s reason=%s key=%s window=[%d,%d) 重复事件：水位线已幂等观察=%d，不计数/不输出",
-				s.id, ev.ID, dupReason, ev.Key, start, end, s.wm.Current())
-			return submitOutcome{reason: dupReason}
-		}
-		// 非重复：Add 已生效，a0 即目标聚合，后续走正常关闭/触发路径。
-		return s.routeAccepted(ev, a0, start, end)
-	}
-
-	// 3) 目标窗口尚不存在：受 MaxKeys 内存上限约束（先 Fire 到点窗口，再尽力回收）。
-	a, rejected := s.getOrCreate(ev.Key, start)
-	if rejected {
-		out := s.fireDueLocked()
-		purged := s.purgeExpiredLocked()
-		// 回收后若腾出位置则放行本次事件，否则才按内存上限拒绝（可观测、可区分）。
-		a2, rej2 := s.getOrCreate(ev.Key, start)
-		if rej2 {
-			s.log("[shard=%d] DROP id=%s reason=%s activeKeys 已达上限 %d (回收 %d 窗口后仍不足)",
-				s.id, ev.ID, DropMemoryLimit, s.cfg.MaxKeys, len(purged))
-			return submitOutcome{results: out, reason: DropMemoryLimit, purged: len(purged)}
-		}
-		a = a2
-	}
-	// 新建窗口中没有历史 ID，Add 必被接受。
-	if ok, reason := a.Add(ev); !ok {
-		return submitOutcome{reason: reason} // 理论不可达，保守处理且不产生输出
-	}
-	return s.routeAccepted(ev, a, start, end)
+	// 输出顺序确定性：本事件的迟到修正（窗口起点升序）在前，到点 FIRE
+	// （按 (start,key) 排序，见 fireDueLocked）在后。滚动窗口下至多一条 UPDATE
+	// 且其窗口即原目标窗口，与老行为逐字节一致。
+	out := append(updates, fired...)
+	return submitOutcome{results: out, drops: drops, purged: len(purged), acceptedN: acceptedN}
 }
 
-// routeAccepted 处理一条已成功计入聚合的事件：已关闭窗口 -> 递增 UPDATE；
-// 随后按确定顺序 Fire 到点窗口，最后清理过宽限期窗口。调用方持锁。
-func (s *shard) routeAccepted(ev event.Event, a *window.Agg, start, end int64) submitOutcome {
-	var lateUpdate *window.Result
-	if a.Closed() {
-		s.log("[shard=%d] LATE-WITHIN-TOLERANCE id=%s eventTime=%d 修正窗口 [%d,%d)",
-			s.id, ev.ID, ev.EventTime, start, end)
-		r := s.emitLocked(a, window.Update)
-		lateUpdate = &r
+// bounds 生成日志用的窗口边界描述。
+func (s *shard) bounds(starts []int64) [][2]int64 {
+	out := make([][2]int64, 0, len(starts))
+	for _, st := range starts {
+		out = append(out, [2]int64{st, s.spec.End(st)})
 	}
-	out := s.fireDueLocked()
-	if lateUpdate != nil {
-		out = append([]window.Result{*lateUpdate}, out...)
-	}
-	purged := s.purgeExpiredLocked()
-	return submitOutcome{results: out, reason: "", purged: len(purged)}
+	return out
 }
 
 // lookupAgg 在不创建窗口的前提下查找聚合；不存在返回 nil。调用方持锁。
@@ -295,10 +298,15 @@ func (s *shard) drain() []window.Result {
 	return s.fireDueLocked()
 }
 
-// activeWindows 返回当前存活窗口总数（跨 key 去重前的 (window,key) 条目数）。
+// activeWindows 返回当前存活窗口总数（跨 key 的 (window,key) 条目数）。
 func (s *shard) activeWindows() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.activeWindowsLocked()
+}
+
+// activeWindowsLocked 统计存活 (window,key) 条目数。调用方持锁。
+func (s *shard) activeWindowsLocked() int {
 	n := 0
 	for _, ks := range s.windows {
 		n += len(ks)

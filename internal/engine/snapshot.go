@@ -69,9 +69,20 @@ func (e *Engine) SaveSnapshot() *Snapshot {
 // Restore 从快照恢复引擎：水位线、窗口状态（含已消费事件 ID 集合）、输出版本号与
 // 计数器全部回到快照点。恢复后重放快照点之前已消费的数据时，这些事件会被识别为
 // DUPLICATE_EVENT 而不会再次计数，也不会产生重复输出，因此"不重不漏"。
+//
+// 窗口划分（大小/步长）必须与生成快照时一致：不同划分下同一 windowStart 语义不同，
+// 混用会造成窗口错位，故此处显式拒绝（分片数、容忍参数等可观测口径以引擎当前配置为准）。
 func (e *Engine) Restore(snap *Snapshot) error {
 	if snap == nil {
 		return fmt.Errorf("snapshot is nil")
+	}
+	snapSlide := snap.Config.SlideMillis
+	if snapSlide == 0 {
+		snapSlide = snap.Config.WindowSizeMillis // 旧版本快照无 slide 字段：零值即滚动
+	}
+	if snap.Config.WindowSizeMillis != e.cfg.WindowSizeMillis || snapSlide != e.cfg.SlideMillis {
+		return fmt.Errorf("window spec mismatch: snapshot size=%d slide=%d, engine size=%d slide=%d",
+			snap.Config.WindowSizeMillis, snapSlide, e.cfg.WindowSizeMillis, e.cfg.SlideMillis)
 	}
 	e.closeMu.Lock()
 	defer e.closeMu.Unlock()

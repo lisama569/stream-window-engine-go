@@ -23,8 +23,8 @@ import (
 
 // 丢弃原因（可观测、可区分；重复原因复用 window.ReasonDuplicate）。
 const (
-	DropLate        = "LATE_BEYOND_TOLERANCE" // 窗口已过水位线宽限期，迟到事件不参与
-	DropMemoryLimit = "MEMORY_LIMIT_REJECTED" // 活跃 key 数达硬上限，且无过期窗口可回收
+	DropLate        = "LATE_BEYOND_TOLERANCE" // 窗口已过水位线宽限期，迟到事件不参与该窗口
+	DropMemoryLimit = "MEMORY_LIMIT_REJECTED" // 活跃 key/窗口数达硬上限，且无过期窗口可回收
 )
 
 // ErrEngineClosed 在引擎 Close 后再提交事件时返回。
@@ -34,8 +34,14 @@ var ErrEngineClosed = errors.New("engine already closed")
 type Config struct {
 	// ShardCount 并发分片数（按 key 哈希）；<=0 时取 1。
 	ShardCount int
-	// WindowSizeMillis 滚动窗口大小（毫秒，必须 >0）。
+	// WindowSizeMillis 窗口大小（毫秒，必须 >0）。
 	WindowSizeMillis int64
+	// SlideMillis 滑动窗口步长（毫秒）：
+	//	<=0 或 == WindowSizeMillis 时为滚动窗口（老行为，每个事件恰好一个窗口）；
+	//	0 < SlideMillis < WindowSizeMillis 时为滑动窗口，同一事件同时进入覆盖它的
+	//	多个窗口（典型：size=5min, slide=1min，每分钟往前看 5 分钟）。
+	//	> WindowSizeMillis 的值会被规范化为 WindowSizeMillis（不留无意义空隙）。
+	SlideMillis int64
 	// OutOfOrderMillis 水位线乱序容忍：WM = maxSeen - OutOfOrderMillis。
 	OutOfOrderMillis int64
 	// AllowedLatenessMillis 窗口 Fire 后仍接受迟到修正的宽限期；
@@ -43,6 +49,11 @@ type Config struct {
 	AllowedLatenessMillis int64
 	// MaxKeys 每个 shard 活跃 key 数硬上限（内存边界）；<=0 表示不限。
 	MaxKeys int
+	// MaxWindows 每个 shard 活跃 (key,window) 聚合条目数硬上限；<=0 表示不限。
+	// 滑动窗口下同一份数据会同时撑开到多份窗口状态，重叠度=ceil(size/slide)，
+	// 用该上限给总量兜底；达到上限且无法回收过期窗口时以 MEMORY_LIMIT_REJECTED
+	// 可观测拒绝，而不是悄悄丢或让状态无界增长。
+	MaxWindows int
 }
 
 func (c Config) normalized() Config {
@@ -51,6 +62,12 @@ func (c Config) normalized() Config {
 	}
 	if c.WindowSizeMillis <= 0 {
 		c.WindowSizeMillis = 1
+	}
+	if c.SlideMillis <= 0 || c.SlideMillis == c.WindowSizeMillis {
+		c.SlideMillis = c.WindowSizeMillis // 缺省/相等：滚动窗口
+	}
+	if c.SlideMillis > c.WindowSizeMillis {
+		c.SlideMillis = c.WindowSizeMillis // 步长不允许超过大小
 	}
 	if c.OutOfOrderMillis < 0 {
 		c.OutOfOrderMillis = 0
@@ -160,18 +177,21 @@ func (e *Engine) Submit(_ context.Context, ev event.Event) error {
 	if out.purged > 0 {
 		e.purgedWindows.Add(int64(out.purged))
 	}
-	switch out.reason {
-	case "":
+	// 每个窗口的拒绝/重复各自一条可区分记录（滑动窗口下同一条事件可能在不同
+	// 窗口得到不同结局）；计数器按窗口条目累加，滚动窗口下口径与历史一致。
+	for _, d := range out.drops {
+		switch d.Reason {
+		case DropLate:
+			e.droppedLate.Add(1)
+		case DropMemoryLimit:
+			e.droppedMemory.Add(1)
+		case window.ReasonDuplicate:
+			e.droppedDup.Add(1)
+		}
+		e.sink.CollectDrop(d)
+	}
+	if out.acceptedN > 0 {
 		e.processed.Add(1)
-	case DropLate:
-		e.droppedLate.Add(1)
-		e.sink.CollectDrop(window.Drop{Ev: ev, Reason: DropLate})
-	case DropMemoryLimit:
-		e.droppedMemory.Add(1)
-		e.sink.CollectDrop(window.Drop{Ev: ev, Reason: DropMemoryLimit})
-	case window.ReasonDuplicate:
-		e.droppedDup.Add(1)
-		e.sink.CollectDrop(window.Drop{Ev: ev, Reason: window.ReasonDuplicate})
 	}
 	return nil
 }
