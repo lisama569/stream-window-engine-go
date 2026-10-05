@@ -26,8 +26,14 @@
 ```
 
 - `Config.SlideMillis` 配滑动步长：
-  - **缺省（0）或等于 `WindowSizeMillis`**：滚动窗口，每个事件恰好命中一个窗口，
-    与历史行为逐结果一致（滑动是滚动的严格泛化，滚动是 `slide=size` 的退化）；
+  - **缺省（0）或等于 `WindowSizeMillis`**：滚动窗口，每个事件恰好命中一个窗口。
+    **兼容保证**：`slide == size` 时原始输出流（含每条输出的顺序、Kind、Version、
+    窗口坐标、聚合值）与滑动窗口引入前的滚动窗口实现**逐字节一致**——包括
+    "水位线已越过某窗口右端之后、更早的事件才补进来"的情形：该事件先计入窗口，
+    窗口在**当次提交**首次关闭（`FIRE` v0 含该事件），后续迟到修正只会产生更高
+    版本的 `UPDATE`，绝不会出现"先看到 v1、再看到 v0"或首次关闭被拖到下一次
+    提交的情况（回归测试见 `TestTumblingDegenerateFireBeforeUpdate`、
+    `TestSlidingDegeneratesToTumbling`）；
   - `0 < slide < size`：滑动窗口，同一事件同时进入覆盖它的多个窗口，典型如
     **"每 1 分钟往前看 5 分钟"** = `WindowSizeMillis=300000, SlideMillis=60000`，
     任一事件最多同时打开 `ceil(size/slide)` 个窗口；
@@ -61,12 +67,19 @@ WM = max(startFloor, maxSeen - maxOutOfOrderness)
 | `UPDATE` | 宽限期内迟到事件对已关闭窗口的修正 | `1, 2, 3, …` 严格递增 |
 
 - 窗口一旦 `FIRE`，永远不会再次 `FIRE`；迟到修正只产生更高版本的 `UPDATE`。
+- **首次关闭永远先于修正**：每条事件的处理次序为"观察水位线 → 逐窗口路由 →
+  统一触发到点窗口 → 清理过宽限期窗口"，因此水位线越过右端后才补进来的事件会
+  先计入窗口、窗口再在**同一次提交**内首次关闭——任何 `(key, window)` 沿输出流
+  的版本序列恒为 `0(FIRE), 1, 2, …(UPDATE)`，绝不倒置，也绝不把到点窗口拖到
+  下一次提交（一次提交让多个窗口同时到点时，当次提交内按 `(windowStart, key)`
+  稳定顺序一次性全部输出）。
 - `Sink.FinalResults()` 折叠所有输出，每个 `(key, windowStart)` 只保留 **Version 最大**
   的一条，即该窗口确定的最终结果；下游可用 Version 做幂等覆盖。
-- 每个分片内部窗口按 `(windowStart, key)` 排序触发；一次提交同时让多个窗口到点时，
-  本事件的迟到修正（窗口起点升序）排在前、到点 FIRE（按 `(start,key)`）排在后。
+- 每个分片内部窗口按 `(windowStart, key)` 排序触发；一次提交内的输出按产生顺序
+  拼接：路由阶段的迟到修正（窗口起点升序）在前、统一触发的到点 FIRE 在后。
   相同输入独立运行两次，**逐条原始输出序列**即字节级一致（见
-  `TestSlidingMultiWindowFireOrder`、`TestDeterministicRepro`）。
+  `TestSlidingMultiWindowFireOrder`、`TestSlidingFirstClosePrecedesUpdateAndSameSubmitFire`、
+  `TestDeterministicRepro`）。
 - 跨分片输出顺序由调度决定、不作全局排序保证；确定性断言以单分片或
   `FinalResults()` 折叠视图为准。
 
@@ -157,15 +170,26 @@ WM = max(startFloor, maxSeen - maxOutOfOrderness)
   `ceil(size/slide)` 份窗口状态（每分钟看 5 分钟即 5 份）。但由于过期窗口过宽限期
   即真正释放，单调事件时间流下活跃窗口数稳态恒为重叠度量级，**不随历史长度增长**；
   每次提交先做一轮 FIRE+清理再路由新事件，因此正常推进的流不会误触上限。
-- 两道**每个分片**的硬上限（<=0 表示不限），满足其一即拒绝新窗口创建：
-  - `Config.MaxKeys`：活跃的不同 key 数（沿用滚动窗口语义）；
-  - `Config.MaxWindows`：活跃 `(key,window)` 聚合条目总数，给滑动窗口的重叠状态
-    兜底。容量规划可按 `MaxWindows ≈ 活跃 key 数 × ceil(size/slide)` 估算。
-- 达到上限且当轮回收后仍不足时，**仅拒绝本次事件真正装不下的那个窗口**，以
-  `MEMORY_LIMIT_REJECTED`（携带窗口坐标）写入 `Sink.Drops()`、计入
-  `Stats.DroppedMemory`；该事件命中的其他仍有容量的窗口照常计入。引擎不返回错误、
-  不被拖死，容量随过期回收恢复后后续事件照常处理（见
-  `TestSlidingCapacityAndStateReclaim`、`TestMemoryLimitObservable`）。
+- 两道**每个分片**的硬上限（<=0 表示不限），分工不同、互不替代：
+  - `Config.MaxKeys`：**只挡"真正的新 key"**——仅当事件所属的 key 在本分片尚不
+    活跃、且活跃 key 数已达上限时才拒绝。已经在本分片活跃的 key 继续开新的
+    重叠窗口**不受 MaxKeys 影响**（滑动窗口下同 key 的 5 个重叠窗口不会被误挡，
+    见 `TestSlidingMaxKeysOnlyBlocksNewKeys`）。
+  - `Config.MaxWindows`：活跃 `(key,window)` 聚合条目总数上限，对**每一个**新
+    条目生效（不分新老 key），给滑动窗口的重叠状态兜底。容量规划可按
+    `MaxWindows ≈ 活跃 key 数 × ceil(size/slide)` 估算。
+- 达到上限时先就地回收（触发到点窗口 + 清理过宽限期窗口）再重试一次；仍不足时
+  **仅拒绝本次事件真正装不下的那个窗口**，以 `MEMORY_LIMIT_REJECTED`（携带窗口
+  坐标）写入 `Sink.Drops()`、计入 `Stats.DroppedMemory`；该事件命中的其他仍有
+  容量的窗口照常计入，其他 key 的窗口结果不被带偏。拒绝与迟到
+  （`LATE_BEYOND_TOLERANCE`）、重复（`DUPLICATE_EVENT`）三种原因在每条 `Drop`
+  上互斥可区分。引擎不返回错误、不被拖死，容量随过期回收恢复后后续事件照常
+  处理（见 `TestSlidingCapacityAndStateReclaim`、`TestMemoryLimitObservable`、
+  `TestSlidingMaxKeysStillEnforced`）。
+- 验证方式：`Stats.DroppedMemory` 计数 + `Sink.Drops()` 中
+  `reason=MEMORY_LIMIT_REJECTED` 且带 `[window_start, window_end)` 坐标的记录；
+  注入 `engine.WithLogger(t.Logf)` 可在测试日志中逐条看到事件时间、水位线、
+  命中窗口列表与每次拒绝的原因。
 
 ## 5. 并发模型
 
@@ -215,6 +239,9 @@ go test . -run Example_localPipeline -v
 | `TestSlidingSnapshotDeterministicBytes` | 同一滑动状态两次快照字节一致 |
 | `TestSlidingRestoreRejectsDifferentSpec` | 窗口划分不一致的恢复被显式拒绝 |
 | `TestSlidingDegeneratesToTumbling` | slide=size 与滚动窗口逐输出/丢弃/计数完全等价 |
+| `TestTumblingDegenerateFireBeforeUpdate` | 滚动退化下"水位线越过后较早事件补进来"：当次提交 FIRE(v0)、修正 UPDATE(v1) 随后，两种滚动等价配置原始输出逐字节一致 |
+| `TestSlidingFirstClosePrecedesUpdateAndSameSubmitFire` | 滑动下任意交错均满足 FIRE(v0) 先于 UPDATE(v1..n)；一次提交多窗口到点当次全部输出；重复运行逐条一致 |
+| `TestSlidingMaxKeysOnlyBlocksNewKeys` | MaxKeys 只挡新 key：已活跃 key 的重叠窗口不被误挡，超限新 key 逐窗口可观测拒绝且不污染其他 key |
 | `TestSlidingConcurrentSameKey` | 滑动窗口同 key 并发计数精确、全窗口计数守恒 |
 
 ## 7. 最小用法

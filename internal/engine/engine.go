@@ -48,6 +48,8 @@ type Config struct {
 	// watermark >= end+AllowedLateness 后窗口清理，再到的事件判迟到丢弃。
 	AllowedLatenessMillis int64
 	// MaxKeys 每个 shard 活跃 key 数硬上限（内存边界）；<=0 表示不限。
+	// 只挡"真正的新 key"：已活跃 key 继续开新的重叠窗口不受此限，
+	// 同 key 的窗口条目总量由 MaxWindows 兜底。
 	MaxKeys int
 	// MaxWindows 每个 shard 活跃 (key,window) 聚合条目数硬上限；<=0 表示不限。
 	// 滑动窗口下同一份数据会同时撑开到多份窗口状态，重叠度=ceil(size/slide)，
