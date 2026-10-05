@@ -64,6 +64,10 @@ func (s *shard) version(key string, start int64) int64 {
 
 // getOrCreate 在持锁状态下取/建聚合；受内存上限约束。
 // 返回 (agg, rejected)：触发内存上限（MaxKeys 或 MaxWindows）时 rejected=true。
+//
+// 两个上限分工：MaxKeys 只挡"真正的新 key"——已活跃 key（在任一窗口已有状态）
+// 继续开新的重叠窗口不受 key 数上限影响，其状态总量由 MaxWindows 兜底；
+// MaxWindows 管 (key,window) 条目总数，对任何新建都生效。
 func (s *shard) getOrCreate(key string, start int64) (*window.Agg, bool) {
 	ks, ok := s.windows[start]
 	if !ok {
@@ -73,7 +77,7 @@ func (s *shard) getOrCreate(key string, start int64) (*window.Agg, bool) {
 	if a, ok := ks[key]; ok {
 		return a, false
 	}
-	if s.cfg.MaxKeys > 0 && s.activeKeysLocked() >= s.cfg.MaxKeys {
+	if s.cfg.MaxKeys > 0 && !s.keyActiveLocked(key) && s.activeKeysLocked() >= s.cfg.MaxKeys {
 		return nil, true
 	}
 	if s.cfg.MaxWindows > 0 && s.activeWindowsLocked() >= s.cfg.MaxWindows {
@@ -83,6 +87,16 @@ func (s *shard) getOrCreate(key string, start int64) (*window.Agg, bool) {
 	a := window.NewAgg(key, start, end)
 	ks[key] = a
 	return a, false
+}
+
+// keyActiveLocked 报告 key 是否在任一窗口已有活跃状态。调用方持锁。
+func (s *shard) keyActiveLocked(key string) bool {
+	for _, ks := range s.windows {
+		if _, ok := ks[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // activeKeysLocked 统计当前分片持有的不同 key 数。调用方持锁。
@@ -190,8 +204,10 @@ func (s *shard) submit(ev event.Event) submitOutcome {
 	s.wm.Observe(ev.EventTime)
 
 	// 2) 先触发到点窗口、再清理过宽限期窗口（严格"先触发、后清理"）。
-	//    滚动窗口下与原行为一致：迟到判定时旧窗口已被 Fire/PURGE；容量判定时也已尽力回收。
-	fired := s.fireDueLocked()
+	//    迟到判定时旧窗口已被 Fire/PURGE；容量判定时也已尽力回收。
+	//    不变式：每次 submit 结束时所有 end<=WM 的已存在窗口都已 Fire（见第 4 步），
+	//    因此这里只会触发"因本次水位线推进而新到点"的窗口。
+	firedPre := s.fireDueLocked()
 	purged := s.purgeExpiredLocked()
 
 	// 3) 事件逐个进入覆盖它的窗口；各窗口独立聚合、独立迟到/重复/容量判定，互不串味。
@@ -238,11 +254,22 @@ func (s *shard) submit(ev event.Event) submitOutcome {
 		acceptedN++
 	}
 
+	// 4) 本次事件新建/计入的窗口若早已到点（水位线在此之前就越过了它的右端），
+	//    必须在【同一次提交】内立即首次关闭：首次关闭（FIRE v0）永远先于该窗口的
+	//    任何修正（UPDATE v1..），绝不拖到下一次提交——滚动退化（slide==size）下
+	//    这正是老版本"先计入、后触发"的原始行为。
+	//    注意：若某窗口是在本次新建且立即到点，则事件时间 t < end <= WM，即本次
+	//    水位线并未因该事件推进，故 firedPre 必为空——firedPre 与 firedPost 天然
+	//    互斥，拼接顺序确定；滚动退化下与老的单次 fireDue 输出逐字节一致。
+	firedPost := s.fireDueLocked()
+	purgedPost := s.purgeExpiredLocked()
+
 	// 输出顺序确定性：本事件的迟到修正（窗口起点升序）在前，到点 FIRE
 	// （按 (start,key) 排序，见 fireDueLocked）在后。滚动窗口下至多一条 UPDATE
 	// 且其窗口即原目标窗口，与老行为逐字节一致。
-	out := append(updates, fired...)
-	return submitOutcome{results: out, drops: drops, purged: len(purged), acceptedN: acceptedN}
+	out := append(updates, firedPre...)
+	out = append(out, firedPost...)
+	return submitOutcome{results: out, drops: drops, purged: len(purged) + len(purgedPost), acceptedN: acceptedN}
 }
 
 // bounds 生成日志用的窗口边界描述。
