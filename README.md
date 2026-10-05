@@ -63,12 +63,29 @@ WM = max(startFloor, maxSeen - maxOutOfOrderness)
 - 窗口一旦 `FIRE`，永远不会再次 `FIRE`；迟到修正只产生更高版本的 `UPDATE`。
 - `Sink.FinalResults()` 折叠所有输出，每个 `(key, windowStart)` 只保留 **Version 最大**
   的一条，即该窗口确定的最终结果；下游可用 Version 做幂等覆盖。
-- 每个分片内部窗口按 `(windowStart, key)` 排序触发；一次提交同时让多个窗口到点时，
-  本事件的迟到修正（窗口起点升序）排在前、到点 FIRE（按 `(start,key)`）排在后。
-  相同输入独立运行两次，**逐条原始输出序列**即字节级一致（见
-  `TestSlidingMultiWindowFireOrder`、`TestDeterministicRepro`）。
+- **首次关闭永远先于修正**：同一 `(key, window)` 的 `FIRE`（Version 0）在输出流中
+  必然排在它的任何 `UPDATE`（Version ≥1）之前。特别地，"水位线已越过某窗口右端
+  之后、较早的事件才补进来"时，该窗口在**收到这条事件的同一次提交**内立即首次
+  关闭（不会因窗口刚创建而拖到下一次提交），之后的补数事件再产生 `UPDATE`——
+  绝不允许先看到 Version 1、再看到 Version 0。
+- **到点不拖延**：一次提交（水位线推进）同时让多个窗口到点时，这些窗口在该次
+  提交内按 `(windowStart, key)` 稳定排序**一次性全部**输出，不拖到下一次提交，
+  也不会有到点窗口漏关；同一次提交内本事件的迟到修正（窗口起点升序）排在前、
+  到点 FIRE（按 `(start,key)`）排在后。
+- 相同输入独立运行两次，**逐条原始输出序列**即字节级一致（见
+  `TestSlidingMultiWindowFireOrder`、`TestSlidingFireOrderAndDeterminism`、
+  `TestDeterministicRepro`）。
 - 跨分片输出顺序由调度决定、不作全局排序保证；确定性断言以单分片或
   `FinalResults()` 折叠视图为准。
+
+### 滚动退化的兼容保证（slide == size）
+`SlideMillis` 缺省（0）或等于 `WindowSizeMillis` 时，每个事件恰好命中一个窗口，
+划分与滚动窗口逐点相同；在此退化配置下引擎的**原始输出序列（含 Kind/Version/
+窗口坐标/聚合值的逐条顺序）与滑动窗口引入前的老版本逐字节一致**——包括上述
+"水位线已越过、较早事件才补进来"时首次关闭的发生时机与版本次序。该兼容由
+金样测试钉死：golden 输出取自老实现实际运行结果（见
+`TestTumblingDegenerateMatchesLegacyByteForByte`、`TestFireAlwaysPrecedesUpdateTumbling`、
+`TestSlidingDegeneratesToTumbling`）。
 
 ## 2. 乱序、迟到事件与重复数据的处理约定
 
@@ -85,9 +102,11 @@ WM = max(startFloor, maxSeen - maxOutOfOrderness)
   而是以原因 `LATE_BEYOND_TOLERANCE` 写入 `Sink.Drops()` 并计入
   `Stats.DroppedLate`。
 
-注意判定基于**事件到达时刻**（该事件时间被观察之后）的水位线，判定顺序为
-"观察时间推进水位线 → 先 FIRE 到点窗口 → 清理过宽限期窗口 → 事件再逐窗口路由"，
-因此推进 WM 的事件不会把自己判成迟到。
+注意判定基于**事件到达时刻**（该事件时间被观察之后）的水位线，单次提交内的
+处理顺序为"观察时间推进水位线 → FIRE 到点窗口 → 清理过宽限期窗口 → 事件逐窗口
+路由（迟到/重复/容量判定）→ 本次新建/计入且早已到点的窗口立即 FIRE → 再清理"，
+因此推进 WM 的事件不会把自己判成迟到，而补进来的较早事件所落入的窗口也不会
+错过当次关闭（首次关闭恒先于后续修正，见上节）。
 
 ### 重叠窗口下的迟到与重复（滑动窗口关键语义）
 一条事件同时命中多个窗口时，迟到/重复/容量判定都是**逐窗口独立**进行的：
@@ -156,16 +175,22 @@ WM = max(startFloor, maxSeen - maxOutOfOrderness)
 - **滑动窗口下状态是按重叠度放大的**：同一份数据会同时撑开到至多
   `ceil(size/slide)` 份窗口状态（每分钟看 5 分钟即 5 份）。但由于过期窗口过宽限期
   即真正释放，单调事件时间流下活跃窗口数稳态恒为重叠度量级，**不随历史长度增长**；
-  每次提交先做一轮 FIRE+清理再路由新事件，因此正常推进的流不会误触上限。
-- 两道**每个分片**的硬上限（<=0 表示不限），满足其一即拒绝新窗口创建：
-  - `Config.MaxKeys`：活跃的不同 key 数（沿用滚动窗口语义）；
-  - `Config.MaxWindows`：活跃 `(key,window)` 聚合条目总数，给滑动窗口的重叠状态
-    兜底。容量规划可按 `MaxWindows ≈ 活跃 key 数 × ceil(size/slide)` 估算。
+  每次提交在路由新事件前后各做一轮 FIRE+清理，因此正常推进的流不会误触上限。
+- 两道**每个分片**的硬上限（<=0 表示不限），分工明确、互不替代：
+  - `Config.MaxKeys`：**只挡"真正的新 key"**——仅当事件携带的 key 当前在分片内
+    没有任何活跃窗口、且活跃 key 数已达上限时才拒绝。已活跃 key 继续开新的
+    重叠窗口（同一 key 同时落入 `ceil(size/slide)` 个窗口是滑动统计的正常语义）
+    **不受 key 数上限影响**，不会被误挡。
+  - `Config.MaxWindows`：活跃 `(key,window)` 聚合条目总数，对**任何**新建窗口
+    条目生效，给滑动窗口的重叠状态总量兜底。容量规划可按
+    `MaxWindows ≈ 活跃 key 数 × ceil(size/slide)` 估算。
 - 达到上限且当轮回收后仍不足时，**仅拒绝本次事件真正装不下的那个窗口**，以
   `MEMORY_LIMIT_REJECTED`（携带窗口坐标）写入 `Sink.Drops()`、计入
-  `Stats.DroppedMemory`；该事件命中的其他仍有容量的窗口照常计入。引擎不返回错误、
-  不被拖死，容量随过期回收恢复后后续事件照常处理（见
-  `TestSlidingCapacityAndStateReclaim`、`TestMemoryLimitObservable`）。
+  `Stats.DroppedMemory`；该事件命中的其他仍有容量的窗口照常计入，被容量拒绝
+  与迟到（`LATE_BEYOND_TOLERANCE`）、重复（`DUPLICATE_EVENT`）严格区分，一条
+  被拒的事件不会把其他窗口的结果带偏。引擎不返回错误、不被拖死，容量随过期
+  回收恢复后后续事件照常处理（见 `TestSlidingCapacityAndStateReclaim`、
+  `TestMaxKeysOnlyBlocksGenuinelyNewKeys`、`TestMemoryLimitObservable`）。
 
 ## 5. 并发模型
 
@@ -215,6 +240,10 @@ go test . -run Example_localPipeline -v
 | `TestSlidingSnapshotDeterministicBytes` | 同一滑动状态两次快照字节一致 |
 | `TestSlidingRestoreRejectsDifferentSpec` | 窗口划分不一致的恢复被显式拒绝 |
 | `TestSlidingDegeneratesToTumbling` | slide=size 与滚动窗口逐输出/丢弃/计数完全等价 |
+| `TestFireAlwaysPrecedesUpdateTumbling` | 水位线越过后补进较早事件：同次提交立即 FIRE，v0 恒先于 v1 |
+| `TestTumblingDegenerateMatchesLegacyByteForByte` | 退化配置原始输出序列与老版本（golden）逐字节一致 |
+| `TestSlidingFireOrderAndDeterminism` | 多窗口同次到点一次性有序输出、FIRE 恒先于 UPDATE、重复运行逐条一致 |
+| `TestMaxKeysOnlyBlocksGenuinelyNewKeys` | MaxKeys 只挡新 key：已活跃 key 的重叠窗口不误挡、超限新 key 才被拒 |
 | `TestSlidingConcurrentSameKey` | 滑动窗口同 key 并发计数精确、全窗口计数守恒 |
 
 ## 7. 最小用法
